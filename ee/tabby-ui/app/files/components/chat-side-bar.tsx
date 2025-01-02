@@ -1,13 +1,14 @@
-import React from 'react'
+import React, { useRef, useState } from 'react'
 import { find } from 'lodash-es'
-import type { Context } from 'tabby-chat-panel'
+import type { FileLocation, GitRepository } from 'tabby-chat-panel'
 import { useClient } from 'tabby-chat-panel/react'
 
+import { RepositoryListQuery } from '@/lib/gql/generates/graphql'
 import { useLatest } from '@/lib/hooks/use-latest'
 import { useMe } from '@/lib/hooks/use-me'
 import { filename2prism } from '@/lib/language-utils'
 import { useChatStore } from '@/lib/stores/chat-store'
-import { cn, formatLineHashForCodeBrowser } from '@/lib/utils'
+import { cn, formatLineHashForLocation } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { IconClose } from '@/components/ui/icons'
 
@@ -16,25 +17,31 @@ import { SourceCodeBrowserContext } from './source-code-browser'
 import { generateEntryPath, getDefaultRepoRef, resolveRepoRef } from './utils'
 
 interface ChatSideBarProps
-  extends Omit<React.HTMLAttributes<HTMLDivElement>, 'children'> {}
+  extends Omit<React.HTMLAttributes<HTMLDivElement>, 'children'> {
+  activeRepo: RepositoryListQuery['repositoryList'][0] | undefined
+}
 
 export const ChatSideBar: React.FC<ChatSideBarProps> = ({
+  activeRepo,
   className,
   ...props
 }) => {
   const [{ data }] = useMe()
+  const [initialized, setInitialized] = useState(false)
   const { pendingEvent, setPendingEvent, repoMap, updateActivePath } =
     React.useContext(SourceCodeBrowserContext)
   const activeChatId = useChatStore(state => state.activeChatId)
   const iframeRef = React.useRef<HTMLIFrameElement>(null)
+  const executedCommand = useRef(false)
   const repoMapRef = useLatest(repoMap)
-  const onNavigate = async (context: Context) => {
-    if (context?.filepath && context?.git_url) {
-      const lineHash = formatLineHashForCodeBrowser(context?.range)
+  const openInCodeBrowser = async (fileLocation: FileLocation) => {
+    const { filepath, location } = fileLocation
+    if (filepath.kind === 'git') {
+      const lineHash = formatLineHashForLocation(location)
       const repoMap = repoMapRef.current
       const matchedRepositoryKey = find(
         Object.keys(repoMap),
-        key => repoMap?.[key]?.gitUrl === context.git_url
+        key => repoMap?.[key]?.gitUrl === filepath.gitUrl
       )
       if (matchedRepositoryKey) {
         const targetRepo = repoMap[matchedRepositoryKey]
@@ -42,31 +49,30 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
           const defaultRef = getDefaultRepoRef(targetRepo.refs)
           // navigate to files of the default branch
           const refName = resolveRepoRef(defaultRef)?.name
-          const detectedLanguage = context.filepath
-            ? filename2prism(context.filepath)[0]
-            : undefined
+          const detectedLanguage = filename2prism(filepath.filepath)[0]
           const isMarkdown = detectedLanguage === 'markdown'
           updateActivePath(
-            generateEntryPath(
-              targetRepo,
-              refName,
-              context.filepath,
-              context.kind
-            ),
+            generateEntryPath(targetRepo, refName, filepath.filepath, 'file'),
             {
               hash: lineHash,
               replace: false,
               plain: isMarkdown && !!lineHash
             }
           )
-          return
+          return true
         }
       }
     }
+    return false
   }
 
+  const readWorkspaceGitRepositories = useLatest(() => {
+    if (!activeRepo) return []
+    const list: GitRepository[] = [{ url: activeRepo.gitUrl }]
+    return list
+  })
+
   const client = useClient(iframeRef, {
-    navigate: onNavigate,
     refresh: async () => {
       window.location.reload()
 
@@ -75,33 +81,36 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
         setTimeout(() => resolve(null), 1000)
       })
     },
-    async onSubmitMessage(_msg, _relevantContext) {},
     onApplyInEditor(_content) {},
-    onLoaded() {},
+    onLoaded() {
+      setInitialized(true)
+    },
     onCopy(_content) {},
     onKeyboardEvent() {},
-    async openInEditor() {
-      return false
-    }
+    openInEditor: async (fileLocation: FileLocation) => {
+      return openInCodeBrowser(fileLocation)
+    },
+    openExternal: async (url: string) => {
+      window.open(url, '_blank')
+    },
+    readWorkspaceGitRepositories: async () => {
+      return readWorkspaceGitRepositories.current?.()
+    },
+    getActiveEditorSelection: async() => {
+      // FIXME(@jueliang) implement
+      return null
+    },
   })
 
-  const getPrompt = ({ action }: QuickActionEventPayload) => {
-    let builtInPrompt = ''
+  const getCommand = ({ action }: QuickActionEventPayload) => {
     switch (action) {
       case 'explain':
-        builtInPrompt = 'Explain the selected code:'
-        break
+        return 'explain'
       case 'generate_unittest':
-        builtInPrompt = 'Generate a unit test for the selected code:'
-        break
+        return 'generate-tests'
       case 'generate_doc':
-        builtInPrompt = 'Generate documentation for the selected code:'
-        break
-      default:
-        break
+        return 'generate-docs'
     }
-
-    return builtInPrompt
   }
 
   React.useEffect(() => {
@@ -112,29 +121,37 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
         }
       })
     }
-  }, [iframeRef?.current, client, data])
+  }, [iframeRef?.current, client?.init, data])
 
   React.useEffect(() => {
-    if (pendingEvent && client) {
-      const { lineFrom, lineTo, code, path, gitUrl } = pendingEvent
-      client.sendMessage({
-        message: getPrompt(pendingEvent),
-        selectContext: {
+    if (pendingEvent && client && initialized) {
+      const execute = async () => {
+        const { lineFrom, lineTo, code, path, gitUrl } = pendingEvent
+        client.updateActiveSelection({
           kind: 'file',
           content: code,
           range: {
             start: lineFrom,
             end: lineTo ?? lineFrom
           },
-          filepath: path,
-          git_url: gitUrl
-        }
-      })
-    }
-    setPendingEvent(undefined)
-  }, [pendingEvent, client])
+          filepath: {
+            kind: 'git',
+            filepath: path,
+            gitUrl
+          }
+        })
+        const command = getCommand(pendingEvent)
+        // FIXME: this delay is a workaround for waiting for the active selection to be updated
+        setTimeout(() => {
+          client.executeCommand(command)
+        }, 500)
+        setPendingEvent(undefined)
+      }
 
-  if (!data?.me) return <></>
+      execute()
+    }
+  }, [initialized, pendingEvent])
+
   return (
     <div className={cn('flex h-full flex-col', className)} {...props}>
       <Header />

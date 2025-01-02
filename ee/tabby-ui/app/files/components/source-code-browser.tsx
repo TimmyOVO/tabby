@@ -192,7 +192,12 @@ const SourceCodeBrowserContextProvider: React.FC<PropsWithChildren> = ({
         })
       } else {
         const setParams: Record<string, string> = {}
-        let delList = ['redirect_filepath', 'redirect_git_url', 'line']
+        let delList = [
+          'redirect_filepath',
+          'redirect_git_url',
+          'redirect_rev',
+          'line'
+        ]
         if (options?.plain) {
           setParams['plain'] = '1'
         } else {
@@ -374,6 +379,8 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
   const { progress, setProgress } = useTopbarProgress()
   const chatSideBarPanelRef = React.useRef<ImperativePanelHandle>(null)
   const [chatSideBarPanelSize, setChatSideBarPanelSize] = React.useState(35)
+  const [chatSidebarInitialized, setChatSidebarInitialized] = useState(false)
+
   const searchQuery = searchParams.get('q')?.toString()
 
   const parsedEntryInfo = React.useMemo(() => {
@@ -501,13 +508,19 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
       const repos = await fetchAllRepositories()
       const redirect_filepath = searchParams.get('redirect_filepath')
       const redirect_git_url = searchParams.get('redirect_git_url')
+      const redirect_rev = searchParams.get('redirect_rev')
 
       if (repos?.length && redirect_filepath && redirect_git_url) {
         const targetRepo = repos.find(repo => repo.gitUrl === redirect_git_url)
         if (targetRepo) {
-          // use default rev
-          const defaultRef = getDefaultRepoRef(targetRepo.refs)
-          const refName = resolveRepoRef(defaultRef)?.name || ''
+          let refName = ''
+          if (redirect_rev) {
+            refName = redirect_rev
+          } else {
+            // use default rev
+            const defaultRef = getDefaultRepoRef(targetRepo.refs)
+            refName = resolveRepoRef(defaultRef)?.name || ''
+          }
 
           const lineRangeInHash = parseLineNumberFromHash(window.location.hash)
           const isValidLineHash = !isNil(lineRangeInHash?.start)
@@ -608,12 +621,23 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
   }, [fetchingRawFile, fetchingTreeEntries])
 
   React.useEffect(() => {
-    if (chatSideBarVisible) {
-      chatSideBarPanelRef.current?.expand()
-      chatSideBarPanelRef.current?.resize(chatSideBarPanelSize)
-    } else {
-      chatSideBarPanelRef.current?.collapse()
+    const initChatSidebar = () => {
+      if (chatSideBarVisible && !chatSidebarInitialized) {
+        setChatSidebarInitialized(true)
+      }
     }
+
+    const toggleChatSidebarPanel = () => {
+      if (chatSideBarVisible) {
+        chatSideBarPanelRef.current?.expand()
+        chatSideBarPanelRef.current?.resize(chatSideBarPanelSize)
+      } else {
+        chatSideBarPanelRef.current?.collapse()
+      }
+    }
+
+    initChatSidebar()
+    toggleChatSidebarPanel()
   }, [chatSideBarVisible])
 
   React.useEffect(() => {
@@ -725,7 +749,9 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
           ref={chatSideBarPanelRef}
           onCollapse={() => setChatSideBarVisible(false)}
         >
-          <ChatSideBar />
+          {chatSidebarInitialized ? (
+            <ChatSideBar activeRepo={activeRepo} />
+          ) : null}
         </ResizablePanel>
       </>
     </ResizablePanelGroup>
